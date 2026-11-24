@@ -157,6 +157,26 @@ def find_peaks(s, pitch):
     return sorted(accepted)
 
 
+def filter_content_peaks(peaks, profile, pitch, min_rel=0.12):
+    """Keep only peaks that sit over real ink. Drop empty ruled-line peaks."""
+    if not peaks:
+        return peaks
+    half = max(3, int(pitch * 0.35))
+    scores = []
+    for y in peaks:
+        lo, hi = max(0, y - half), min(len(profile), y + half + 1)
+        scores.append(float(profile[lo:hi].sum()))
+    scores = np.asarray(scores)
+    # Relative to the strongest content peak (not the global max of empty noise)
+    ref = max(scores.max(), 1.0)
+    keep = scores >= (min_rel * ref)
+    # Also require absolute ink so completely blank pages don't invent lines
+    abs_thr = 8.0 * half  # roughly a few ink pixels per row across the band
+    keep = keep & (scores >= abs_thr)
+    filtered = [p for p, k in zip(peaks, keep) if k]
+    return filtered
+
+
 def find_seam(cost, y0, half, vpen=0.08, prior_w=0.1):
     """Cheapest left-to-right path near row y0, moving at most one row per column."""
     h, w = cost.shape
@@ -197,6 +217,14 @@ def segment_lines(gray):
     pitch = estimate_pitch(profile)
     s = smooth1d(profile, max(2.0, pitch / 6.0))
     peaks = find_peaks(s, pitch)
+    # Drop peaks that sit on empty ruled lines / blank regions
+    peaks = filter_content_peaks(peaks, profile, pitch)
+    if not peaks:
+        return ink, [], pitch
+
+    # Hard stop: do not place seams past the last row that still has meaningful ink
+    last_ink = int(np.max(np.where(profile > 3)[0])) if np.any(profile > 3) else h - 1
+    peaks = [p for p in peaks if p <= last_ink + int(pitch * 0.4)]
     if not peaks:
         return ink, [], pitch
 
@@ -208,7 +236,9 @@ def segment_lines(gray):
     for a, b in zip(peaks[:-1], peaks[1:]):
         y0 = a + int(np.argmin(s[a:b + 1]))
         seams.append(find_seam(cost, y0, half))
-    seams.append(np.full(w, min(h - 1, peaks[-1] + int(pitch * 0.6)), np.int32))
+    # Bottom seam sits just under the last real line, not at the bottom of the page
+    bottom_y = min(h - 1, peaks[-1] + int(pitch * 0.55), last_ink + int(pitch * 0.35))
+    seams.append(np.full(w, bottom_y, np.int32))
 
     for i in range(1, len(seams)):  # seams never cross
         seams[i] = np.maximum(seams[i], seams[i - 1] + 1)
@@ -221,8 +251,10 @@ def crop_line(gray, ink, top, bot, pad_x=12):
     y0, y1 = int(top.min()), int(bot.max()) + 1
     rows = np.arange(y0, y1)[:, None]
     mask = (rows >= top[None, :]) & (rows <= bot[None, :])
-    cols = np.where((ink[y0:y1] > 0) & mask)[1]
-    if cols.size < 20:
+    ink_mask = (ink[y0:y1] > 0) & mask
+    cols = np.where(ink_mask)[1]
+    # Require both enough ink pixels and a minimum horizontal span
+    if cols.size < 40 or (cols.max() - cols.min()) < 30:
         return None
     x0, x1 = max(0, cols.min() - pad_x), min(w, cols.max() + pad_x + 1)
     out = np.where(mask, gray[y0:y1], 255).astype(np.uint8)
