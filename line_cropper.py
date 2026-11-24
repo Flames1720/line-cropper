@@ -352,6 +352,20 @@ def find_seam(cost, y0, half, vpen=0.35, prior_w=0.25):
     return path + lo
 
 
+def guided_rule_seams(gray, ink, guide_ys):
+    """Build seams that follow rules but route around handwriting strokes."""
+    h, w = gray.shape
+    rule_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 8, 24), 1))
+    rule_ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, rule_kernel)
+    rule_ink = cv2.dilate(rule_ink, np.ones((3, 1), np.uint8), iterations=1)
+    text_ink = (ink > 0) & ~(rule_ink > 0)
+    dist = cv2.distanceTransform((~text_ink).astype(np.uint8), cv2.DIST_L2, 5)
+    cost = 1.0 / (1.0 + dist) + 18.0 * text_ink.astype(np.float32)
+    pitch = float(np.median(np.diff(guide_ys))) if len(guide_ys) > 1 else 40.0
+    half = max(5, int(pitch * 0.42))
+    return [find_seam(cost, int(y), half, vpen=0.55, prior_w=1.2) for y in guide_ys]
+
+
 def segment_freeform(gray, ink):
     h, w = gray.shape
     profile = (ink > 0).sum(axis=1).astype(np.float64)
@@ -397,9 +411,10 @@ def segment_lines(gray):
             ruled_ys = None
 
     if ruled_ys is not None and len(ruled_ys) >= 2:
-        seams = [np.full(w, y, np.int32) for y in ruled_ys]
+        seams = guided_rule_seams(gray, ink, ruled_ys)
         if ruled_ys[0] > 15:
-            seams.insert(0, np.full(w, max(0, ruled_ys[0] - int((ruled_ys[1] - ruled_ys[0]) * 0.9)), np.int32))
+            y = max(0, ruled_ys[0] - int((ruled_ys[1] - ruled_ys[0]) * 0.9))
+            seams.insert(0, np.full(w, y, np.int32))
         if h - 1 - ruled_ys[-1] > 15:
             pitch_est = float(np.median(np.diff(ruled_ys))) if len(ruled_ys) > 1 else 40
             seams.append(np.full(w, min(h - 1, ruled_ys[-1] + int(pitch_est * 0.9)), np.int32))
@@ -408,7 +423,7 @@ def segment_lines(gray):
 
     profile_ys, profile_pitch = detect_profile_ys(gray)
     if profile_ys is not None and len(profile_ys) >= 3:
-        seams = [np.full(w, y, np.int32) for y in profile_ys]
+        seams = guided_rule_seams(gray, ink, profile_ys)
         seams.insert(0, np.full(w, max(0, profile_ys[0] - int(profile_pitch * 0.8)), np.int32))
         seams.append(np.full(w, min(h - 1, profile_ys[-1] + int(profile_pitch * 0.8)), np.int32))
         return ink, seams, profile_pitch
