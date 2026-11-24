@@ -98,56 +98,88 @@ def crop_page(img):
 
 
 # ------------------------------------------------------------ orientation
-def detect_ruled_angle(gray):
-    """Find dominant angle of long near-horizontal structures."""
-    h, w = gray.shape
-    s = 700.0 / max(h, w)
-    small = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    sh, sw = small.shape
-
-    blur = cv2.GaussianBlur(small, (3, 3), 0)
-    edges = cv2.Canny(blur, 40, 120)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(sw // 8, 20), 1))
-    long_h = cv2.morphologyEx(edges, cv2.MORPH_OPEN, k)
-
-    lines = cv2.HoughLinesP(
-        long_h, 1, np.pi / 180, threshold=40,
-        minLineLength=int(sw * 0.35), maxLineGap=15,
+def _rotate_expand(gray, angle):
+    """Rotate without clipping the page or changing its scale."""
+    h, w = gray.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos, sin = abs(M[0, 0]), abs(M[0, 1])
+    out_w = int(np.ceil(h * sin + w * cos))
+    out_h = int(np.ceil(h * cos + w * sin))
+    M[0, 2] += out_w / 2.0 - center[0]
+    M[1, 2] += out_h / 2.0 - center[1]
+    return cv2.warpAffine(
+        gray, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=255,
     )
-    if lines is None or len(lines) < 3:
-        lines = cv2.HoughLinesP(
-            edges, 1, np.pi / 180, threshold=50,
-            minLineLength=int(sw * 0.4), maxLineGap=20,
-        )
+
+
+def _horizontal_structure_score(gray, angle):
+    """Measure how much long horizontal structure remains after a rotation."""
+    h, w = gray.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        gray, M, (w, h), flags=cv2.INTER_AREA,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=255,
+    )
+    edges = cv2.Canny(cv2.GaussianBlur(rotated, (3, 3), 0), 40, 120)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(12, w // 10), 1))
+    long_horizontal = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel)
+    return float(np.count_nonzero(long_horizontal)) / max(float(w * h), 1.0)
+
+
+def detect_ruled_angle(gray):
+    """Find the dominant page-line orientation, including vertical lines."""
+    h, w = gray.shape
+    scale = min(1.0, 900.0 / max(h, w))
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape
+    edges = cv2.Canny(cv2.GaussianBlur(small, (3, 3), 0), 40, 120)
+    min_len = max(25, int(min(sh, sw) * 0.16))
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 360, threshold=max(20, int(min(sh, sw) * 0.08)),
+        minLineLength=min_len, maxLineGap=max(10, int(min(sh, sw) * 0.025)),
+    )
     if lines is None:
         return 0.0
 
+    # Lines are undirected: -90° and +90° represent the same orientation.
+    bins = np.zeros(180, np.float64)
     angles = []
     for x1, y1, x2, y2 in lines[:, 0]:
-        dx, dy = x2 - x1, y2 - y1
-        if abs(dx) < 5:
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = float(np.hypot(dx, dy))
+        if length < min_len:
             continue
-        ang = np.degrees(np.arctan2(dy, dx))
-        if abs(ang) < 20:
-            angles.append(ang)
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        angle = ((angle + 90.0) % 180.0) - 90.0
+        angles.append((angle, length))
+        bins[int(round(angle + 90.0)) % 180] += length ** 1.35
     if len(angles) < 2:
         return 0.0
-    return float(np.median(angles))
+
+    # Smooth the circular histogram and refine the winning cluster by length.
+    smooth = np.convolve(np.r_[bins[-3:], bins, bins[:3]], np.ones(7) / 7, mode="valid")
+    peak = int(np.argmax(smooth)) - 90
+    cluster = [(a, length) for a, length in angles if abs(a - peak) <= 7.0]
+    if not cluster:
+        return float(peak)
+    return float(np.average([a for a, _ in cluster], weights=[length ** 1.35 for _, length in cluster]))
 
 
 def deskew(gray):
-    """Rotate so printed ruled lines become horizontal."""
+    """Rotate so printed ruled lines become horizontal, at any input angle."""
     angle = detect_ruled_angle(gray)
     if abs(angle) < 0.3:
         return gray
-    h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(
-        gray, M, (w, h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=255,
-    )
+
+    # Hough orientation has no direction, so test both signs. This also makes
+    # the result robust to OpenCV's image-coordinate angle convention.
+    small_scale = min(1.0, 700.0 / max(gray.shape))
+    probe = cv2.resize(gray, None, fx=small_scale, fy=small_scale, interpolation=cv2.INTER_AREA)
+    chosen = angle if _horizontal_structure_score(probe, angle) >= _horizontal_structure_score(probe, -angle) else -angle
+    return _rotate_expand(gray, chosen)
 
 
 # ------------------------------------------------------------ ruled-line detection
