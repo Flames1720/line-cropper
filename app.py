@@ -108,7 +108,7 @@ HTML = r"""
 <body>
   <div class="container">
     <h1>Line Cropper</h1>
-    <p class="sub">Drop one or more page photos or a PDF. Empty ruled lines are ignored; only real handwriting/print is kept.</p>
+    <p class="sub">Drop page photos or a PDF (lined notebooks). Seams follow the printed ruled lines.</p>
 
     <div class="drop" id="drop">
       <div style="font-size: 1.8rem;">📄</div>
@@ -152,7 +152,7 @@ HTML = r"""
     });
 
     async function processFiles(fileList) {
-      status.textContent = 'Processing… this can take a few seconds per page';
+      status.textContent = 'Processing… a few seconds per page';
       status.className = 'status';
       results.classList.remove('show');
       pagesEl.innerHTML = '';
@@ -174,10 +174,13 @@ HTML = r"""
             `<div class="line-item"><span>Line ${String(i+1).padStart(2,'0')}</span>
              <img src="data:image/png;base64,${b64}" alt="line ${i+1}"></div>`
           ).join('');
+          const debugBlock = page.debug
+            ? `<h3>Straightened page + red seams (on ruled lines)</h3>
+               <img class="debug" src="data:image/png;base64,${page.debug}" alt="seams">`
+            : `<p class="hint">No preview for this page</p>`;
           block.innerHTML = `
-            <h2>${page.label} · ${page.lines.length} lines (pitch ~${page.pitch}px)</h2>
-            <h3>Straightened page + red seams</h3>
-            <img class="debug" src="data:image/png;base64,${page.debug}" alt="seams">
+            <h2>${page.label} · ${page.lines.length} lines${page.pitch ? ` (pitch ~${page.pitch}px)` : ''}</h2>
+            ${debugBlock}
             <h3>Cropped lines</h3>
             <div class="lines">${linesHtml || '<p class="hint">No content lines found</p>'}</div>
           `;
@@ -246,7 +249,8 @@ def process_bgr(img: np.ndarray) -> dict:
     }
 
 
-def pdf_to_images(pdf_bytes: bytes, max_pages: int = 30) -> List[np.ndarray]:
+def pdf_to_images(pdf_bytes: bytes, max_pages: int = 12) -> List[np.ndarray]:
+    """Render PDF pages. Capped for serverless time limits."""
     try:
         import fitz
     except ImportError:
@@ -254,13 +258,18 @@ def pdf_to_images(pdf_bytes: bytes, max_pages: int = 30) -> List[np.ndarray]:
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
-    for i, page in enumerate(doc):
-        if i >= max_pages:
-            break
-        mat = fitz.Matrix(2.0, 2.0)
+    n = min(len(doc), max_pages)
+    for i in range(n):
+        page = doc[i]
+        mat = fitz.Matrix(1.7, 1.7)  # ~120 dpi
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif pix.n == 1:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         images.append(img)
     doc.close()
     return images
@@ -307,7 +316,13 @@ def process():
                 try:
                     result = process_bgr(img)
                 except Exception as e:
-                    return jsonify({"error": f"Processing failed on {label}: {e}"}), 500
+                    pages_out.append({
+                        "label": f"{label} (failed: {e})",
+                        "pitch": 0,
+                        "debug": "",
+                        "lines": [],
+                    })
+                    continue
 
                 folder = f"page_{page_idx:02d}"
                 zf.writestr(f"{folder}/debug_seams.png", result["debug_bytes"])
