@@ -130,7 +130,13 @@ def _horizontal_structure_score(gray, angle):
 
 
 def detect_ruled_angle(gray):
-    """Find the dominant page-line orientation, including vertical lines."""
+    """Find the angle that makes the repeated ruled lines horizontal.
+
+    A page border can be longer than any individual ruled line, so selecting
+    only the strongest Hough segment is unreliable. Instead, use Hough only
+    to add likely candidates, then score every candidate by the amount of
+    long, repeated horizontal structure it creates.
+    """
     h, w = gray.shape
     scale = min(1.0, 900.0 / max(h, w))
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -141,31 +147,24 @@ def detect_ruled_angle(gray):
         edges, 1, np.pi / 360, threshold=max(20, int(min(sh, sw) * 0.08)),
         minLineLength=min_len, maxLineGap=max(10, int(min(sh, sw) * 0.025)),
     )
-    if lines is None:
-        return 0.0
+    candidates = list(np.arange(-90.0, 90.0, 2.0))
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            dx, dy = float(x2 - x1), float(y2 - y1)
+            if np.hypot(dx, dy) < min_len:
+                continue
+            angle = ((float(np.degrees(np.arctan2(dy, dx))) + 90.0) % 180.0) - 90.0
+            candidates.extend((angle - 1.0, angle, angle + 1.0))
 
-    # Lines are undirected: -90° and +90° represent the same orientation.
-    bins = np.zeros(180, np.float64)
-    angles = []
-    for x1, y1, x2, y2 in lines[:, 0]:
-        dx, dy = float(x2 - x1), float(y2 - y1)
-        length = float(np.hypot(dx, dy))
-        if length < min_len:
-            continue
-        angle = float(np.degrees(np.arctan2(dy, dx)))
-        angle = ((angle + 90.0) % 180.0) - 90.0
-        angles.append((angle, length))
-        bins[int(round(angle + 90.0)) % 180] += length ** 1.35
-    if len(angles) < 2:
+    # Hough can return many nearly identical segments. Deduplicate before
+    # evaluating so a phone photo never causes an unbounded search.
+    candidates = sorted({round(float(angle), 1) for angle in candidates})
+    # Evaluate on the reduced image; this remains bounded for phone photos.
+    scores = [(_horizontal_structure_score(small, angle), angle) for angle in candidates]
+    best_score, best_angle = max(scores, key=lambda pair: pair[0])
+    if best_score < 1e-5:
         return 0.0
-
-    # Smooth the circular histogram and refine the winning cluster by length.
-    smooth = np.convolve(np.r_[bins[-3:], bins, bins[:3]], np.ones(7) / 7, mode="valid")
-    peak = int(np.argmax(smooth)) - 90
-    cluster = [(a, length) for a, length in angles if abs(a - peak) <= 7.0]
-    if not cluster:
-        return float(peak)
-    return float(np.average([a for a, _ in cluster], weights=[length ** 1.35 for _, length in cluster]))
+    return float(best_angle)
 
 
 def deskew(gray):
