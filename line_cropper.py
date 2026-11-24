@@ -86,14 +86,14 @@ def crop_page(img):
 # ------------------------------------------------------------ preprocessing
 def binarize(gray):
     h, w = gray.shape
-    block = (max(h, w) // 30) | 1
+    block = (max(h, w) // 28) | 1
     g = cv2.GaussianBlur(gray, (3, 3), 0)
     ink = cv2.adaptiveThreshold(
-        g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 12
+        g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 10
     )
     n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
     keep = np.zeros(n, bool)
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 12
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 8  # keep thin pencil strokes
     return np.where(keep[labels], 255, 0).astype(np.uint8)
 
 
@@ -136,32 +136,38 @@ def smooth1d(a, sigma):
 
 
 def estimate_pitch(profile):
-    p = smooth1d(profile.astype(np.float64), 2.0)
+    """Estimate typical line spacing. Prefer the smallest strong period (dense handwriting)."""
+    p = smooth1d(profile.astype(np.float64), 1.5)
     p = p - p.mean()
     ac = np.correlate(p, p, "full")[len(p) - 1:]
-    lo, hi = 12, max(14, len(p) // 3)
+    lo, hi = 10, max(16, len(p) // 3)
+    candidates = []
     for lag in range(lo, min(hi, len(ac) - 1)):
-        if ac[lag] > ac[lag - 1] and ac[lag] >= ac[lag + 1] and ac[lag] > 0.25 * ac[0]:
-            return lag
-    return lo + int(np.argmax(ac[lo:hi]))
+        if ac[lag] > ac[lag - 1] and ac[lag] >= ac[lag + 1] and ac[lag] > 0.18 * ac[0]:
+            candidates.append((lag, float(ac[lag])))
+    if not candidates:
+        return lo + int(np.argmax(ac[lo:hi]))
+    best = max(candidates, key=lambda t: t[1] * (1.0 + 0.15 * (hi - t[0]) / max(hi - lo, 1)))
+    return best[0]
 
 
 def find_peaks(s, pitch):
-    thr = 0.2 * s.max()
+    thr = 0.12 * s.max()  # lower threshold to catch weaker but real lines
     cands = [i for i in range(1, len(s) - 1) if s[i] >= s[i - 1] and s[i] > s[i + 1] and s[i] > thr]
     cands.sort(key=lambda i: -s[i])
     accepted = []
+    min_sep = max(8, int(0.42 * pitch))  # allow closer lines on dense pages
     for i in cands:
-        if all(abs(i - j) >= 0.6 * pitch for j in accepted):
+        if all(abs(i - j) >= min_sep for j in accepted):
             accepted.append(i)
     return sorted(accepted)
 
 
-def filter_content_peaks(peaks, profile, pitch, min_rel=0.12):
+def filter_content_peaks(peaks, profile, pitch, min_rel=0.08):
     """Keep only peaks that sit over real ink. Drop empty ruled-line peaks."""
     if not peaks:
         return peaks
-    half = max(3, int(pitch * 0.35))
+    half = max(3, int(pitch * 0.30))
     scores = []
     for y in peaks:
         lo, hi = max(0, y - half), min(len(profile), y + half + 1)
@@ -169,14 +175,14 @@ def filter_content_peaks(peaks, profile, pitch, min_rel=0.12):
     scores = np.asarray(scores)
     ref = max(scores.max(), 1.0)
     keep = scores >= (min_rel * ref)
-    abs_thr = 8.0 * half
+    abs_thr = 5.0 * half
     keep = keep & (scores >= abs_thr)
     filtered = [p for p, k in zip(peaks, keep) if k]
     return filtered
 
 
-def find_seam(cost, y0, half, vpen=0.08, prior_w=0.1):
-    """Cheapest left-to-right path near row y0, moving at most one row per column."""
+def find_seam(cost, y0, half, vpen=0.35, prior_w=0.25):
+    """Cheapest left-to-right path near row y0. Higher vpen keeps path smoother."""
     h, w = cost.shape
     lo, hi = max(0, y0 - half), min(h, y0 + half + 1)
     n = hi - lo
@@ -215,27 +221,32 @@ def segment_lines(gray):
     pitch = estimate_pitch(profile)
     s = smooth1d(profile, max(2.0, pitch / 6.0))
     peaks = find_peaks(s, pitch)
+    # Drop peaks that sit on empty ruled lines / blank regions
     peaks = filter_content_peaks(peaks, profile, pitch)
     if not peaks:
         return ink, [], pitch
 
+    # Hard stop: do not place seams past the last row that still has meaningful ink
     last_ink = int(np.max(np.where(profile > 3)[0])) if np.any(profile > 3) else h - 1
     peaks = [p for p in peaks if p <= last_ink + int(pitch * 0.4)]
     if not peaks:
         return ink, [], pitch
 
     dist = cv2.distanceTransform((seg_ink == 0).astype(np.uint8), cv2.DIST_L2, 5)
-    cost = 1.0 / (1.0 + dist) + 2.0 * (seg_ink > 0)
-    half = max(4, int(pitch * 0.5))
+    # Heavy penalty for crossing ink; strong preference for the middle of white gaps
+    cost = 1.0 / (1.0 + dist) + 12.0 * (seg_ink > 0)
+    half = max(3, int(pitch * 0.32))  # tighter band so seam stays in the gap
 
-    seams = [np.full(w, max(0, peaks[0] - int(pitch * 0.6)), np.int32)]
+    seams = [np.full(w, max(0, peaks[0] - int(pitch * 0.55)), np.int32)]
     for a, b in zip(peaks[:-1], peaks[1:]):
-        y0 = a + int(np.argmin(s[a:b + 1]))
+        # Prefer the actual lowest-ink row between the two peaks
+        gap = s[a:b + 1]
+        y0 = a + int(np.argmin(gap))
         seams.append(find_seam(cost, y0, half))
-    bottom_y = min(h - 1, peaks[-1] + int(pitch * 0.55), last_ink + int(pitch * 0.35))
+    bottom_y = min(h - 1, peaks[-1] + int(pitch * 0.50), last_ink + int(pitch * 0.30))
     seams.append(np.full(w, bottom_y, np.int32))
 
-    for i in range(1, len(seams)):
+    for i in range(1, len(seams)):  # seams never cross
         seams[i] = np.maximum(seams[i], seams[i - 1] + 1)
     seams = [np.clip(sm, 0, h - 1) for sm in seams]
     return ink, seams, pitch
@@ -248,6 +259,7 @@ def crop_line(gray, ink, top, bot, pad_x=12):
     mask = (rows >= top[None, :]) & (rows <= bot[None, :])
     ink_mask = (ink[y0:y1] > 0) & mask
     cols = np.where(ink_mask)[1]
+    # Require both enough ink pixels and a minimum horizontal span
     if cols.size < 40 or (cols.max() - cols.min()) < 30:
         return None
     x0, x1 = max(0, cols.min() - pad_x), min(w, cols.max() + pad_x + 1)
@@ -255,6 +267,7 @@ def crop_line(gray, ink, top, bot, pad_x=12):
     return out[:, x0:x1]
 
 
+# --------------------------------------------------------------------- main
 def process(path, outdir):
     img = cv2.imread(path)
     if img is None:
