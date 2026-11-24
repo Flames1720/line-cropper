@@ -66,21 +66,17 @@ def crop_page(img):
     if area_ratio < 0.15 or area_ratio > 0.98:
         return img
 
+    # Do not trust a four-point approximation here. Notebook edges are often
+    # interrupted by shadows or writing, and approxPolyDP can promote an
+    # interior edge to a false corner (which can rotate an upright page 90°).
+    # The minimum-area rectangle is deliberately conservative: it keeps the
+    # whole page focused and leaves only mild residual skew for deskew().
     hull = cv2.convexHull(c)
-    peri = cv2.arcLength(hull, True)
-    quad = None
-    for eps in (0.02, 0.03, 0.05, 0.08, 0.12):
-        approx = cv2.approxPolyDP(hull, eps * peri, True)
-        if len(approx) == 4:
-            quad = approx
-            break
-    if quad is None:
-        rect = cv2.minAreaRect(hull)
-        quad = cv2.boxPoints(rect)
+    quad = cv2.boxPoints(cv2.minAreaRect(hull))
 
     pts = order_points(quad) / scale
     cx, cy = pts.mean(axis=0)
-    expand = 1.04
+    expand = 1.01
     pts = cx + (pts - cx) * expand
     pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
@@ -130,13 +126,7 @@ def _horizontal_structure_score(gray, angle):
 
 
 def detect_ruled_angle(gray):
-    """Find the angle that makes the repeated ruled lines horizontal.
-
-    A page border can be longer than any individual ruled line, so selecting
-    only the strongest Hough segment is unreliable. Instead, use Hough only
-    to add likely candidates, then score every candidate by the amount of
-    long, repeated horizontal structure it creates.
-    """
+    """Find the dominant repeated ruled-line orientation, including vertical."""
     h, w = gray.shape
     scale = min(1.0, 900.0 / max(h, w))
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -147,24 +137,32 @@ def detect_ruled_angle(gray):
         edges, 1, np.pi / 360, threshold=max(20, int(min(sh, sw) * 0.08)),
         minLineLength=min_len, maxLineGap=max(10, int(min(sh, sw) * 0.025)),
     )
-    candidates = list(np.arange(-90.0, 90.0, 2.0))
-    if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0]:
-            dx, dy = float(x2 - x1), float(y2 - y1)
-            if np.hypot(dx, dy) < min_len:
-                continue
-            angle = ((float(np.degrees(np.arctan2(dy, dx))) + 90.0) % 180.0) - 90.0
-            candidates.extend((angle - 1.0, angle, angle + 1.0))
-
-    # Hough can return many nearly identical segments. Deduplicate before
-    # evaluating so a phone photo never causes an unbounded search.
-    candidates = sorted({round(float(angle), 1) for angle in candidates})
-    # Evaluate on the reduced image; this remains bounded for phone photos.
-    scores = [(_horizontal_structure_score(small, angle), angle) for angle in candidates]
-    best_score, best_angle = max(scores, key=lambda pair: pair[0])
-    if best_score < 1e-5:
+    if lines is None:
         return 0.0
-    return float(best_angle)
+
+    # Lines are undirected: -90° and +90° represent the same orientation.
+    # Repeated notebook rules produce many segments at one angle; borders and
+    # handwriting usually produce fewer, so population is more reliable than
+    # the longest single segment.
+    bins = np.zeros(180, np.float64)
+    angles = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = float(np.hypot(dx, dy))
+        if length < min_len:
+            continue
+        angle = ((float(np.degrees(np.arctan2(dy, dx))) + 90.0) % 180.0) - 90.0
+        angles.append((angle, length))
+        bins[int(round(angle + 90.0)) % 180] += 1.0 + 0.15 * (length / max(min_len, 1))
+    if len(angles) < 2:
+        return 0.0
+
+    smooth = np.convolve(np.r_[bins[-3:], bins, bins[:3]], np.ones(7) / 7, mode="valid")
+    peak = int(np.argmax(smooth)) - 90
+    cluster = [(a, length) for a, length in angles if abs(a - peak) <= 7.0]
+    if not cluster:
+        return float(peak)
+    return float(np.average([a for a, _ in cluster], weights=[length for _, length in cluster]))
 
 
 def deskew(gray):
@@ -247,6 +245,47 @@ def detect_ruled_ys(gray):
         merged = cleaned
 
     return merged, coverage
+
+
+def detect_profile_ys(gray):
+    """Find repeated horizontal separators from the page-wide intensity profile.
+
+    This handles faint notebook rules that adaptive thresholding loses after
+    a phone photo's lighting and handwriting have been normalized.
+    """
+    h, _ = gray.shape
+    profile = np.median(gray.astype(np.float32), axis=1)
+    profile = cv2.GaussianBlur(profile.reshape(-1, 1), (1, 7), 0).ravel()
+    darkness = profile.max() - profile
+    lo, hi = int(h * 0.04), int(h * 0.96)
+    if hi - lo < 20:
+        return None, 0.0
+    threshold = float(np.percentile(darkness[lo:hi], 45))
+    raw = [
+        i for i in range(lo + 2, hi - 2)
+        if darkness[i] >= darkness[i - 1]
+        and darkness[i] > darkness[i + 1]
+        and darkness[i] >= threshold
+    ]
+    gap = max(10, int(h * 0.018))
+    peaks = []
+    for i in raw:
+        if not peaks or i - peaks[-1] >= gap:
+            peaks.append(i)
+        elif darkness[i] > darkness[peaks[-1]]:
+            peaks[-1] = i
+    if len(peaks) < 3:
+        return None, 0.0
+    diffs = np.diff(peaks).astype(np.float64)
+    regular = diffs[(diffs >= gap) & (diffs <= max(gap * 2, h * 0.05))]
+    pitch = float(np.median(regular if len(regular) else diffs))
+    filled = [peaks[0]]
+    for target in peaks[1:]:
+        while target - filled[-1] > pitch * 1.55:
+            filled.append(int(round(filled[-1] + pitch)))
+        if target - filled[-1] >= gap:
+            filled.append(target)
+    return filled, pitch
 
 
 def _smooth1d(a, sigma):
@@ -351,6 +390,13 @@ def segment_lines(gray):
     ruled_ys, coverage = detect_ruled_ys(gray)
 
     if ruled_ys is not None and len(ruled_ys) >= 2:
+        ruled_pitch = float(np.median(np.diff(ruled_ys))) if len(ruled_ys) > 1 else 0.0
+        # A pitch close to the whole page means the detector found only the
+        # outer border, not the notebook's repeated rules.
+        if len(ruled_ys) < 4 or ruled_pitch > h * 0.20:
+            ruled_ys = None
+
+    if ruled_ys is not None and len(ruled_ys) >= 2:
         seams = [np.full(w, y, np.int32) for y in ruled_ys]
         if ruled_ys[0] > 15:
             seams.insert(0, np.full(w, max(0, ruled_ys[0] - int((ruled_ys[1] - ruled_ys[0]) * 0.9)), np.int32))
@@ -359,6 +405,13 @@ def segment_lines(gray):
             seams.append(np.full(w, min(h - 1, ruled_ys[-1] + int(pitch_est * 0.9)), np.int32))
         pitch = float(np.median(np.diff(ruled_ys))) if len(ruled_ys) > 1 else 40.0
         return ink, seams, pitch
+
+    profile_ys, profile_pitch = detect_profile_ys(gray)
+    if profile_ys is not None and len(profile_ys) >= 3:
+        seams = [np.full(w, y, np.int32) for y in profile_ys]
+        seams.insert(0, np.full(w, max(0, profile_ys[0] - int(profile_pitch * 0.8)), np.int32))
+        seams.append(np.full(w, min(h - 1, profile_ys[-1] + int(profile_pitch * 0.8)), np.int32))
+        return ink, seams, profile_pitch
 
     seams, pitch = segment_freeform(gray, ink)
     return ink, seams, pitch
